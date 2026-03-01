@@ -26,3 +26,6 @@
 
 # ...even if they are in subdirectories
 !*/
+
+# Always ignore .agents directory
+.agents/

@@ -29,3 +29,6 @@
 
 # Always ignore .agents directory
 .agents/
+
+# HTML files
+!*.html

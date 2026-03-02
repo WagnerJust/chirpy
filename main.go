@@ -1,13 +1,20 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode"
+
+	"github.com/WagnerJust/chirpy/internal/database"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
@@ -63,6 +70,8 @@ func respondWithJSON(res http.ResponseWriter, code int, payload interface{}) err
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries  *database.Queries
+	platform string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc (next http.Handler) http.Handler {
@@ -84,28 +93,71 @@ func (cfg *apiConfig) getHitCount (res http.ResponseWriter, req *http.Request) {
 	res.Write([]byte(bodyText))
 }
 
-func (cfg *apiConfig) resetHitCount (res http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) reset (res http.ResponseWriter, req *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(res, 403, "Unauthorized")
+		return
+	}
+	err := cfg.dbQueries.DeleteAllUsers(req.Context())
+	if err != nil {
+		respondWithError(res, 500, err.Error())
+		return
+	}
 	res.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	res.WriteHeader(200)
 	cfg.fileserverHits = atomic.Int32{}
-	res.Write([]byte("Successfully reset hit count!"))
+	res.Write([]byte("Successfully reset!"))
 }
 
-
-func validateChirp (res http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) createUser(res http.ResponseWriter, req *http.Request) {
 	type params struct {
-		Body string `json:"body"`
+		Email string `json:"email"`
 	}
 	p := params{}
 	decoder := json.NewDecoder(req.Body)
 	err := decoder.Decode(&p)
-	if err != nil {
+	if err !=  nil {
 		errString := fmt.Sprintf("Error marshalling JSON: %s", err)
 		respondWithError(res, 500, errString)
 		return
 	}
-	length := len(p.Body)
 
+	userParams := database.CreateUserParams{
+		Email: p.Email,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	user, err := cfg.dbQueries.CreateUser(req.Context(), userParams)
+	if err !=  nil {
+		errString := fmt.Sprintf("Error creating user: %s", err)
+		respondWithError(res, 500, errString)
+		return
+	}
+	respondWithJSON(res, 201, user)
+}
+
+func (cfg *apiConfig) createChirp (res http.ResponseWriter, req *http.Request) {
+	type params struct {
+		Body string `json:"body"`
+		UserId uuid.UUID `json:"user_id"`
+	}
+	p := params{}
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&p)
+	if err !=  nil {
+		errString := fmt.Sprintf("Error marshalling JSON: %s", err)
+		respondWithError(res, 500, errString)
+		return
+	}
+
+
+	user, err := cfg.dbQueries.FindUserById(req.Context(), p.UserId)
+	if err != nil {
+		respondWithError(res, 400, err.Error())
+		return
+	}
+
+	length := len(p.Body)
 	if length > 140 {
 		respondWithError(res, 400, "Chirp is too long")
 		return
@@ -120,19 +172,23 @@ func validateChirp (res http.ResponseWriter, req *http.Request) {
 		"sharbert",
 		"fornax",
 	}
-
 	cleanedBody := cleanChirp(p.Body, bWords)
 
-	payload := struct {
-		valid bool
-		CleanedBody string `json:"cleaned_body"`
-	} {
-		valid: true,
-		CleanedBody: cleanedBody,
+	chirpParams := database.CreateChirpParams{
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID: user.ID,
+		Body: cleanedBody,
 	}
-	respondWithJSON(res, 200, payload)
 
+	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), chirpParams)
+	if err != nil {
+		respondWithError(res, 500, err.Error())
+		return
+	}
+	respondWithJSON(res, 201, chirp)
 }
+
 
 func addRoutes (mux *http.ServeMux, config *apiConfig) {
 
@@ -144,9 +200,10 @@ func addRoutes (mux *http.ServeMux, config *apiConfig) {
 
 	//api endpoints
 	mux.Handle("GET /admin/metrics", http.HandlerFunc(config.getHitCount))
-	mux.Handle("POST /admin/reset", http.HandlerFunc(config.resetHitCount))
+	mux.Handle("POST /admin/reset", http.HandlerFunc(config.reset))
 
-	mux.Handle("POST /api/validate_chirp", http.HandlerFunc(validateChirp))
+	mux.Handle("POST /api/users", http.HandlerFunc(config.createUser))
+	mux.Handle("POST /api/chirps", http.HandlerFunc(config.createChirp))
 	////////////////
 
 
@@ -160,18 +217,46 @@ func getHealthStatus(res http.ResponseWriter, req *http.Request) {
 }
 
 func main () {
+	godotenv.Load()
+
+	// get environment
+	env := os.Getenv("PLATFORM")
+
+	// connect to db
+	dbURL := os.Getenv("GOOSE_DBSTRING")
+	driver := os.Getenv("GOOSE_DRIVER")
+	if env == "dev" {
+		log.Printf("Environment: %s", env)
+		log.Printf("Database URL: %s", dbURL)
+		log.Printf("Driver: %s", driver)
+		fmt.Println()
+		fmt.Println()
+	}
+	db, err := sql.Open(driver, dbURL)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	log.Print("Successfully connected to database")
+	defer db.Close()
+
+
+	// config server
 	serveMux := http.NewServeMux()
 	config := &apiConfig{}
+	config.platform = env
+	config.dbQueries = database.New(db)
+
 	addRoutes(serveMux, config)
 	server := http.Server{
 		Addr: ":8081",
 		Handler: serveMux,
 	}
-	err := server.ListenAndServe()
+
+	// start server
+	log.Printf("Server at address %s", server.Addr)
+	err = server.ListenAndServe()
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 	defer server.Close()
-
-
 }
